@@ -1,0 +1,16 @@
+[package]
+name = "doclatex"
+version = "0.1.0"
+edition = "2021"
+description = "Compile LaTeX directly to Microsoft Word (.docx) with macro expansion, cross-references, equation numbering, acronyms and bibliography support"
+license = "MIT"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.dev]
+debug = false
+
+[profile.release]
+opt-level = 2
+debug = false
