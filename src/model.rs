@@ -183,12 +183,19 @@ pub enum Block {
         align: Option<Align>,
         indent: bool,
     },
+    Environment {
+        name: String,
+        content: Vec<Block>,
+    },
+    Caption {
+        kind: String,
+        inlines: Vec<Inline>,
+    },
     List {
         kind: ListKind,
         items: Vec<ListItem>,
     },
     DefinitionList(Vec<(Vec<Inline>, Vec<Block>)>),
-    Quote(Vec<Block>),
     AlignBlock(Align, Vec<Block>),
     Verbatim {
         lines: Vec<String>,

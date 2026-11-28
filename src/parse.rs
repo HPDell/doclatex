@@ -47,6 +47,7 @@ pub struct Parser<'a> {
     blocks: Vec<Block>,
     footnotes: Vec<Block>,
     list_depth: usize,
+    float_kinds: Vec<String>,
     pending_align: Option<Align>,
     pending_indent: bool,
     title: Option<Vec<Token>>,
@@ -54,6 +55,7 @@ pub struct Parser<'a> {
     date: Option<Vec<Token>>,
     thanks: Vec<Vec<Token>>,
     in_preamble: bool,
+    begin_document_hooks: Vec<Token>,
     stop_document: bool,
     /// paragraph collector state
     para: Vec<Inline>,
@@ -81,6 +83,7 @@ pub fn parse_document(
         blocks: vec![],
         footnotes: vec![],
         list_depth: 0,
+        float_kinds: vec![],
         pending_align: None,
         pending_indent: true,
         title: None,
@@ -88,6 +91,7 @@ pub fn parse_document(
         date: None,
         thanks: vec![],
         in_preamble: true,
+        begin_document_hooks: vec![],
         stop_document: false,
         para: vec![],
         para_align: None,
@@ -145,6 +149,7 @@ fn is_block_start(t: &Token) -> bool {
                 | "begin"
                 | "end"
                 | "item"
+                | "bibitem"
                 | "maketitle"
                 | "tableofcontents"
                 | "listoffigures"
@@ -272,6 +277,7 @@ impl<'a> Parser<'a> {
                         self.cur.pos += 1;
                         self.make_title();
                     }
+                    "caption" | "captionof" => self.nested_caption(&name),
                     "tableofcontents" => {
                         self.cur.pos += 1;
                         self.blocks.push(Block::Toc);
@@ -617,8 +623,21 @@ impl<'a> Parser<'a> {
             "thanks" => {
                 self.thanks.push(self.cur.read_group());
             }
-            "geometry"
-            | "hypersetup"
+            "AtBeginDocument" => {
+                let mut hook = self.cur.read_group();
+                self.begin_document_hooks.append(&mut hook);
+            }
+            "geometry" | "newgeometry" => {
+                let options = detokenize(&self.cur.read_group());
+                for kv in split_keyvals(&options) {
+                    if let Some((key, value)) = kv.split_once('=') {
+                        if key.trim() == "textwidth" {
+                            self.st.text_width_pt = parse_len_frac(value, self.st.text_width_pt);
+                        }
+                    }
+                }
+            }
+            "hypersetup"
             | "pagestyle"
             | "thispagestyle"
             | "pagenumbering"
@@ -639,22 +658,28 @@ impl<'a> Parser<'a> {
                 let _ = self.cur.read_group();
                 if matches!(
                     name,
-                    "geometry"
-                        | "hypersetup"
-                        | "setmainfont"
-                        | "setsansfont"
-                        | "setmonofont"
-                        | "setCJKmainfont"
+                    "hypersetup" | "setmainfont" | "setsansfont" | "setmonofont" | "setCJKmainfont"
                 ) {
                     let _ = self.cur.read_optional();
                 }
             }
-            "setlength" | "addtolength" | "addcontentsline" => {
-                let _ = self.cur.read_group();
-                let _ = self.cur.read_group();
-                if name == "addcontentsline" {
-                    let _ = self.cur.read_group();
+            "setlength" | "addtolength" => {
+                let target = detokenize(&self.cur.read_group());
+                let value = self.cur.read_group();
+                if target.trim().trim_start_matches('\\') == "textwidth" {
+                    let mut cur = Cursor::new(value);
+                    let value = scan_dimen(self.st, &mut cur) * 72.0 / 72.27;
+                    if name == "addtolength" {
+                        self.st.text_width_pt += value;
+                    } else {
+                        self.st.text_width_pt = value;
+                    }
                 }
+            }
+            "addcontentsline" => {
+                let _ = self.cur.read_group();
+                let _ = self.cur.read_group();
+                let _ = self.cur.read_group();
             }
             "newacronym" | "newglossaryentry" | "gls" | "Gls" | "glspl" | "Glspl" | "glslink"
             | "acrshort" | "acrlong" | "acrfull" | "Acrshort" | "Acrlong" | "Acrfull" | "ac"
@@ -1211,6 +1236,7 @@ impl<'a> Parser<'a> {
             "today" => {
                 buf.push_str("today");
             }
+            "newblock" => buf.push(' '),
             "caption" | "captionof" => {
                 self.cur.pos -= 1;
                 return;
@@ -2114,15 +2140,14 @@ impl<'a> Parser<'a> {
         let mut width: Option<f64> = None;
         let mut height: Option<f64> = None;
         if let Some(opts) = self.cur.read_optional() {
-            let text_width_pt = 469.0; // 6.5in text block
             for kv in split_keyvals(&detokenize(&opts)) {
                 if let Some((k, v)) = kv.split_once('=') {
                     let k = k.trim();
                     let v = v.trim();
                     match k {
                         "scale" => scale = v.parse().unwrap_or(1.0),
-                        "width" => width = Some(parse_len_frac(v, text_width_pt)),
-                        "height" => height = Some(parse_len_frac(v, text_width_pt)),
+                        "width" => width = Some(parse_len_frac(v, self.st.text_width_pt)),
+                        "height" => height = Some(parse_len_frac(v, self.st.text_width_pt)),
                         _ => {}
                     }
                 }
@@ -2181,17 +2206,17 @@ impl<'a> Parser<'a> {
                 })
             })
             .unwrap_or((600, 400));
+        let (natural_width, natural_height) =
+            natural_size.unwrap_or_else(|| bitmap_natural_size(&data, w_px, h_px));
+        let (width_pt, height_pt) =
+            resolve_graphic_size(width, height, scale, (natural_width, natural_height));
         Some(Image {
             path: path.to_string_lossy().to_string(),
             data,
             width_px: w_px,
             height_px: h_px,
-            width_pt: width
-                .or_else(|| natural_size.map(|s| s.0))
-                .map(|w| w * scale),
-            height_pt: height
-                .or_else(|| natural_size.map(|s| s.1))
-                .map(|h| h * scale),
+            width_pt: Some(width_pt),
+            height_pt: Some(height_pt),
             alt: name,
         })
     }
@@ -2208,45 +2233,32 @@ impl<'a> Parser<'a> {
                 self.flush_para();
                 self.in_preamble = false;
                 self.st.in_preamble = false;
+                let hooks = std::mem::take(&mut self.begin_document_hooks);
+                self.cur.toks.splice(self.cur.pos..self.cur.pos, hooks);
             }
             "abstract" => {
                 self.flush_para();
-                let title = if self.st.chinese {
-                    "摘要".to_string()
-                } else {
-                    "Abstract".to_string()
-                };
-                self.blocks.push(Block::Heading {
-                    level: 1,
-                    number: None,
-                    title: vec![Inline::Text(title)],
-                    anchor: None,
-                    kind: HeadingKind::Other,
-                });
-                self.parse_env_body_blocks(&env);
+                self.parse_styled_environment(&env);
             }
             "itemize" => self.parse_list(ListKind::Bullet, &env),
             "enumerate" => self.parse_list(ListKind::Number, &env),
             "description" => self.parse_deflist(&env),
             "quote" | "quotation" | "verse" => {
                 self.flush_para();
-                let inner = self.parse_env_body_blocks(&env);
-                self.blocks.push(Block::Quote(inner));
+                self.parse_styled_environment(&env);
             }
-            "center" => {
+            "center" | "flushleft" | "flushright" => {
                 self.flush_para();
+                let align = match base.as_str() {
+                    "center" => Align::Center,
+                    "flushleft" => Align::Left,
+                    _ => Align::Right,
+                };
                 let inner = self.parse_env_body_blocks(&env);
-                self.blocks.push(Block::AlignBlock(Align::Center, inner));
-            }
-            "flushleft" => {
-                self.flush_para();
-                let inner = self.parse_env_body_blocks(&env);
-                self.blocks.push(Block::AlignBlock(Align::Left, inner));
-            }
-            "flushright" => {
-                self.flush_para();
-                let inner = self.parse_env_body_blocks(&env);
-                self.blocks.push(Block::AlignBlock(Align::Right, inner));
+                self.blocks.push(Block::Environment {
+                    name: env.clone(),
+                    content: vec![Block::AlignBlock(align, inner)],
+                });
             }
             "verbatim" | "lstlisting" => {
                 self.flush_para();
@@ -2294,13 +2306,9 @@ impl<'a> Parser<'a> {
                     let _ = w;
                 }
                 let _ = self.cur.read_group();
-                let inner = self.parse_env_body_blocks(&env);
-                self.blocks.extend(inner);
+                self.parse_styled_environment(&env);
             }
-            "titlepage" => {
-                let inner = self.parse_env_body_blocks(&env);
-                self.blocks.extend(inner);
-            }
+            "titlepage" => self.parse_styled_environment(&env),
             _ => {
                 if self.st.theorems.contains_key(&base) {
                     self.flush_para();
@@ -2311,8 +2319,7 @@ impl<'a> Parser<'a> {
                     self.st
                         .warn(format!("unknown environment `{}`; contents kept", env));
                     self.flush_para();
-                    let inner = self.parse_env_body_blocks(&env);
-                    self.blocks.extend(inner);
+                    self.parse_styled_environment(&env);
                 }
             }
         }
@@ -2345,6 +2352,14 @@ impl<'a> Parser<'a> {
         let inner = std::mem::replace(&mut self.blocks, saved_blocks);
         self.para = saved_para;
         inner
+    }
+
+    fn parse_styled_environment(&mut self, env: &str) {
+        let inner = self.parse_env_body_blocks(env);
+        self.blocks.push(Block::Environment {
+            name: env.to_string(),
+            content: inner,
+        });
     }
 
     fn parse_list(&mut self, kind: ListKind, env: &str) {
@@ -2393,7 +2408,8 @@ impl<'a> Parser<'a> {
             if self.peek_is_end(env) {
                 break;
             }
-            if matches!(self.cur.peek(), Some(Token::CtrlSeq(n)) if n == "item" || n == "end") {
+            if matches!(self.cur.peek(), Some(Token::CtrlSeq(n)) if n == "item" || n == "bibitem" || n == "end")
+            {
                 break;
             }
             self.parse_block();
@@ -2434,9 +2450,52 @@ impl<'a> Parser<'a> {
         self.blocks.push(Block::DefinitionList(items));
     }
 
+    fn nested_caption(&mut self, name: &str) {
+        self.cur.pos += 1;
+        let kind = if name == "captionof" {
+            detokenize(&self.cur.read_group())
+        } else {
+            self.float_kinds
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "figure".into())
+        };
+        let _short = self.cur.read_optional();
+        let group = self.cur.read_group();
+        self.st.refstep(&kind);
+        let number = self.st.the_counter(&kind);
+        let content = self.parse_inlines_toks(group, &mut Style::default());
+        let title = inlines_to_text(&content);
+        self.st.current_ref = Some(RefTarget {
+            counter: kind.clone(),
+            number: number.clone(),
+            title: Some(title),
+        });
+        let kind_name = if kind == "table" { "Table" } else { "Figure" };
+        let mut inlines = vec![Inline::Text(format!("{} {}: ", kind_name, number))];
+        inlines.extend(content);
+
+        let saved = self.cur.pos;
+        self.cur.skip_spaces();
+        if matches!(self.cur.peek(), Some(Token::CtrlSeq(n)) if n == "label") {
+            self.cur.pos += 1;
+            let group = self.cur.read_group();
+            let key = detokenize(&group).trim().to_string();
+            self.register_label(&key);
+            inlines.push(Inline::Meta(format!(
+                "anchor:{}",
+                bib::sanitize_anchor(&key)
+            )));
+        } else {
+            self.cur.pos = saved;
+        }
+        self.blocks.push(Block::Caption { kind, inlines });
+    }
+
     fn parse_float(&mut self, env: &str, kind: &str) {
         self.flush_para();
         let _ = self.cur.read_optional();
+        self.float_kinds.push(kind.to_string());
         let saved_blocks = std::mem::take(&mut self.blocks);
         let saved_para = std::mem::take(&mut self.para);
         let mut caption: Option<Caption> = None;
@@ -2517,6 +2576,7 @@ impl<'a> Parser<'a> {
         }
         let inner = std::mem::replace(&mut self.blocks, saved_blocks);
         self.para = saved_para;
+        self.float_kinds.pop();
         // caption block embedded: if no caption but anchor exists, attach anyway
         self.blocks.push(Block::Figure {
             content: inner,
@@ -2549,11 +2609,14 @@ impl<'a> Parser<'a> {
         if let Some((k, _, _, _)) = self.labels.last() {
             anchor = Some(bib::sanitize_anchor(k));
         }
-        self.blocks.push(Block::Theorem {
-            name: thmname,
-            number,
-            content: inner,
-            anchor,
+        self.blocks.push(Block::Environment {
+            name: env.to_string(),
+            content: vec![Block::Theorem {
+                name: thmname,
+                number,
+                content: inner,
+                anchor,
+            }],
         });
     }
 
@@ -2592,7 +2655,10 @@ impl<'a> Parser<'a> {
         self.cur.toks = new_toks;
         // parse body
         let inner = self.parse_env_body_blocks(env);
-        self.blocks.extend(inner);
+        self.blocks.push(Block::Environment {
+            name: env.to_string(),
+            content: inner,
+        });
         // end tokens
         let mut etoks = end_toks.clone();
         substitute_args(&mut etoks, &args);
@@ -3046,7 +3112,9 @@ fn fixup_blocks(blocks: &mut [Block]) {
                     fixup_blocks(bs);
                 }
             }
-            Block::Quote(bs) | Block::AlignBlock(_, bs) => fixup_blocks(bs),
+            Block::AlignBlock(_, bs) => fixup_blocks(bs),
+            Block::Environment { content, .. } => fixup_blocks(content),
+            Block::Caption { inlines, .. } => fixup_text(inlines),
             Block::Figure {
                 content, caption, ..
             } => {
@@ -3153,6 +3221,22 @@ fn split_keyvals(s: &str) -> Vec<String> {
     out
 }
 
+fn resolve_graphic_size(
+    width: Option<f64>,
+    height: Option<f64>,
+    scale: f64,
+    natural_size: (f64, f64),
+) -> (f64, f64) {
+    let (natural_width, natural_height) = natural_size;
+    let ratio = natural_height / natural_width.max(f64::EPSILON);
+    match (width, height) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, w * ratio),
+        (None, Some(h)) => (h / ratio, h),
+        (None, None) => (natural_width * scale, natural_height * scale),
+    }
+}
+
 fn parse_len_frac(v: &str, textwidth: f64) -> f64 {
     let v = v.trim();
     for suffix in ["\\textwidth", "\\linewidth", "\\columnwidth"] {
@@ -3162,7 +3246,7 @@ fn parse_len_frac(v: &str, textwidth: f64) -> f64 {
         }
     }
     let mut cur = Cursor::new(lex(v, &default_catcodes()));
-    scan_dimen(&State::new(), &mut cur)
+    scan_dimen(&State::new(), &mut cur) * 72.0 / 72.27
 }
 
 fn pdf_to_svg(path: &std::path::Path) -> Result<Vec<u8>, String> {
@@ -3265,6 +3349,79 @@ fn parse_svg_length(value: &str) -> Option<f64> {
     Some(points)
 }
 
+fn bitmap_natural_size(data: &[u8], width_px: u32, height_px: u32) -> (f64, f64) {
+    if let Some((x_dpi, y_dpi)) = image_resolution(data) {
+        return (
+            width_px as f64 * 72.0 / x_dpi,
+            height_px as f64 * 72.0 / y_dpi,
+        );
+    }
+    (
+        width_px as f64 * 72.0 / 96.0,
+        height_px as f64 * 72.0 / 96.0,
+    )
+}
+
+fn image_resolution(data: &[u8]) -> Option<(f64, f64)> {
+    if data.len() >= 24 && &data[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let mut pos = 8usize;
+        while pos + 12 <= data.len() {
+            let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
+            let end = pos.checked_add(12)?.checked_add(len)?;
+            if end > data.len() {
+                break;
+            }
+            if &data[pos + 4..pos + 8] == b"pHYs" && len == 9 {
+                let payload = pos + 8;
+                let x = u32::from_be_bytes([
+                    data[payload],
+                    data[payload + 1],
+                    data[payload + 2],
+                    data[payload + 3],
+                ]);
+                let y = u32::from_be_bytes([
+                    data[payload + 4],
+                    data[payload + 5],
+                    data[payload + 6],
+                    data[payload + 7],
+                ]);
+                if data[payload + 8] == 1 && x > 0 && y > 0 {
+                    return Some((x as f64 * 0.0254, y as f64 * 0.0254));
+                }
+            }
+            pos = end;
+        }
+    }
+    if data.len() > 4 && &data[0..3] == b"\xff\xd8\xff" {
+        let mut pos = 2usize;
+        while pos + 16 <= data.len() {
+            if data[pos] != 0xff {
+                pos += 1;
+                continue;
+            }
+            let marker = data[pos + 1];
+            let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+            if marker == 0xe0 && &data[pos + 4..pos + 9] == b"JFIF\0" {
+                let x = u16::from_be_bytes([data[pos + 12], data[pos + 13]]) as f64;
+                let y = u16::from_be_bytes([data[pos + 14], data[pos + 15]]) as f64;
+                if x > 0.0 && y > 0.0 {
+                    match data[pos + 11] {
+                        1 => return Some((x, y)),
+                        2 => return Some((x * 2.54, y * 2.54)),
+                        _ => {}
+                    }
+                }
+            }
+            if len < 2 {
+                break;
+            }
+            pos = pos.checked_add(2)?.checked_add(len)?;
+        }
+    }
+    None
+}
+
 fn image_size(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() >= 24 && &data[0..8] == b"\x89PNG\r\n\x1a\n" {
         let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
@@ -3357,5 +3514,133 @@ mod tests {
         assert!(
             matches!(result.doc.blocks.last(), Some(Block::Para { inlines, .. }) if has_visible_content(inlines))
         );
+    }
+
+    #[test]
+    fn caption_inside_centered_float_is_consumed() {
+        let mut st = State::new();
+        let tokens = lex(
+            r"\begin{document}\begin{table}\begin{center}\caption{Results}\label{tab:r}\begin{tabular}{l}X\end{tabular}\end{center}\end{table}\end{document}",
+            &default_catcodes(),
+        );
+        let result = parse_document(&mut st, tokens, &AuxData::default(), &mut BibState::new());
+        let content = result
+            .doc
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Figure { content, kind, .. } if kind == "table" => Some(content),
+                _ => None,
+            })
+            .unwrap();
+        assert!(content.iter().any(|block| match block {
+            Block::Environment { content, .. } => content.iter().any(|block| match block {
+                Block::AlignBlock(_, blocks) => blocks.iter().any(|block| match block {
+                    Block::Caption { kind, inlines } =>
+                        kind == "table" && inlines_to_text(inlines).contains("Table 1: Results"),
+                    _ => false,
+                }),
+                _ => false,
+            }),
+            _ => false,
+        }));
+        assert!(result.doc.labels.iter().any(|label| label.0 == "tab:r"));
+    }
+
+    #[test]
+    fn bibliography_stops_each_item_at_the_next_bibitem() {
+        let mut st = State::new();
+        let tokens = lex(
+            r"\begin{document}\begin{thebibliography}{10}\bibitem{first}First entry.\bibitem{second}Second entry.\end{thebibliography}\end{document}",
+            &default_catcodes(),
+        );
+        let result = parse_document(&mut st, tokens, &AuxData::default(), &mut BibState::new());
+        let items = result
+            .doc
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::BibSection { items, .. } => Some(items),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "first");
+        assert_eq!(items[1].key, "second");
+        assert_eq!(inlines_to_text(&items[0].content).trim(), "First entry.");
+        assert_eq!(inlines_to_text(&items[1].content).trim(), "Second entry.");
+    }
+
+    #[test]
+    fn paragraph_environments_preserve_style_names() {
+        let mut st = State::new();
+        let tokens = lex(
+            r"\begin{document}\begin{abstract}Summary.\end{abstract}\begin{proof}Reasoning.\end{proof}\end{document}",
+            &default_catcodes(),
+        );
+        let result = parse_document(&mut st, tokens, &AuxData::default(), &mut BibState::new());
+        assert_eq!(result.doc.blocks.len(), 2);
+        assert!(matches!(
+            &result.doc.blocks[0],
+            Block::Environment { name, content }
+                if name == "abstract" && matches!(content.first(), Some(Block::Para { .. }))
+        ));
+        assert!(matches!(
+            &result.doc.blocks[1],
+            Block::Environment { name, .. } if name == "proof"
+        ));
+        assert!(!result
+            .doc
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Heading { .. })));
+    }
+
+    #[test]
+    fn graphic_lengths_use_document_text_width() {
+        let mut st = State::new();
+        let tokens = lex(
+            r"\AtBeginDocument{\newgeometry{textwidth=5.5in}}\begin{document}Text\end{document}",
+            &default_catcodes(),
+        );
+        let _ = parse_document(&mut st, tokens, &AuxData::default(), &mut BibState::new());
+        assert!((st.text_width_pt - 396.0).abs() < 0.001);
+        assert!((parse_len_frac(r"0.5\textwidth", st.text_width_pt) - 198.0).abs() < 0.001);
+        assert!((parse_len_frac("2in", st.text_width_pt) - 144.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn graphic_size_honors_scale_and_aspect_ratio() {
+        let natural = (300.0, 600.0);
+        assert_eq!(
+            resolve_graphic_size(None, None, 0.6, natural),
+            (180.0, 360.0)
+        );
+        assert_eq!(
+            resolve_graphic_size(Some(200.0), None, 0.6, natural),
+            (200.0, 400.0)
+        );
+        assert_eq!(
+            resolve_graphic_size(None, Some(200.0), 0.6, natural),
+            (100.0, 200.0)
+        );
+        assert_eq!(
+            resolve_graphic_size(Some(200.0), Some(100.0), 0.6, natural),
+            (200.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn png_natural_size_uses_resolution() {
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.extend(9u32.to_be_bytes());
+        data.extend(b"pHYs");
+        data.extend(11811u32.to_be_bytes());
+        data.extend(11811u32.to_be_bytes());
+        data.push(1);
+        data.extend([0; 4]);
+        let (width, height) = bitmap_natural_size(&data, 300, 150);
+        assert!((width - 72.0).abs() < 0.001);
+        assert!((height - 36.0).abs() < 0.001);
     }
 }

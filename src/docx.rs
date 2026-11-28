@@ -51,6 +51,9 @@ struct Renderer {
     bookmark_id: u32,
     drawing_id: u32,
     list_depth: usize,
+    table_depth: usize,
+    environment_styles: Vec<String>,
+    used_environments: Vec<String>,
     last_was_paragraph: bool,
 }
 
@@ -65,6 +68,9 @@ pub fn write_docx(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error:
         bookmark_id: 1,
         drawing_id: 1,
         list_depth: 0,
+        table_depth: 0,
+        environment_styles: vec![],
+        used_environments: vec![],
         last_was_paragraph: false,
     };
     renderer.blocks(&doc.blocks, None);
@@ -85,6 +91,7 @@ pub fn write_docx(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error:
     );
     let document_rels = renderer.document_relationships();
     let footnotes = renderer.footnotes_xml();
+    let styles = styles(&renderer.used_environments);
     let images = renderer.images;
 
     let file = File::create(path)?;
@@ -99,7 +106,7 @@ pub fn write_docx(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error:
     part("_rels/.rels", root_relationships().as_bytes())?;
     part("word/document.xml", document.as_bytes())?;
     part("word/_rels/document.xml.rels", document_rels.as_bytes())?;
-    part("word/styles.xml", styles().as_bytes())?;
+    part("word/styles.xml", styles.as_bytes())?;
     part("word/numbering.xml", numbering().as_bytes())?;
     part("word/footnotes.xml", footnotes.as_bytes())?;
     part("word/settings.xml", settings().as_bytes())?;
@@ -142,6 +149,23 @@ impl Renderer {
             }
             Block::Para { inlines, align, indent } => {
                 self.paragraph(inlines, None, forced_align.or(*align), *indent);
+            }
+            Block::Environment { name, content } => {
+                if !self.used_environments.contains(name) {
+                    self.used_environments.push(name.clone());
+                }
+                self.environment_styles.push(name.clone());
+                self.blocks(content, forced_align);
+                self.environment_styles.pop();
+            }
+            Block::Caption { kind, inlines } => {
+                self.xml.push_str(&format!(
+                    "<w:p><w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>",
+                    caption_style(kind)
+                ));
+                self.inlines(inlines, &RunStyle::default());
+                self.xml.push_str("</w:p>");
+                self.last_was_paragraph = true;
             }
             Block::List { kind, items } => {
                 let depth = self.list_depth;
@@ -192,10 +216,6 @@ impl Renderer {
                     self.blocks(content, None);
                 }
             }
-            Block::Quote(content) => {
-                self.xml.push_str("<w:p><w:pPr><w:pStyle w:val=\"Quote\"/></w:pPr></w:p>");
-                self.blocks(content, forced_align);
-            }
             Block::AlignBlock(align, content) => self.blocks(content, Some(*align)),
             Block::Verbatim { lines, .. } => {
                 for line in lines {
@@ -209,7 +229,10 @@ impl Renderer {
             Block::Figure { content, caption, anchor, kind } => {
                 self.blocks(content, None);
                 if let Some(caption) = caption {
-                    self.xml.push_str("<w:p><w:pPr><w:pStyle w:val=\"Caption\"/></w:pPr>");
+                    self.xml.push_str(&format!(
+                        "<w:p><w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>",
+                        caption_style(kind)
+                    ));
                     let caption_anchor = caption.label.as_ref().or(anchor.as_ref()).cloned();
                     let name = if kind == "table" { "Table" } else { "Figure" };
                     self.text_run(&format!("{} ", name), &RunStyle::default());
@@ -288,7 +311,15 @@ impl Renderer {
             Block::PageBreak => self.xml.push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>"),
             Block::HRule => self.xml.push_str("<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"000000\"/></w:pBdr></w:pPr></w:p>"),
             Block::Theorem { name, number, content, anchor } => {
-                self.xml.push_str("<w:p><w:pPr><w:pStyle w:val=\"Theorem\"/></w:pPr>");
+                let style = self
+                    .environment_styles
+                    .last()
+                    .map(|name| environment_style_id(name))
+                    .unwrap_or_else(|| "Theorem".into());
+                self.xml.push_str(&format!(
+                    "<w:p><w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>",
+                    style
+                ));
                 self.text_run(name, &RunStyle { bold: true, ..RunStyle::default() });
                 if let Some(number) = number {
                     self.text_run(" ", &RunStyle { bold: true, ..RunStyle::default() });
@@ -317,16 +348,24 @@ impl Renderer {
         align: Option<Align>,
         indent: bool,
     ) {
+        let image_paragraph = contains_image(inlines);
+        let in_table = self.table_depth > 0;
+        let (align, indent) = paragraph_layout(inlines, align, indent, in_table);
+        let style = paragraph_style(
+            style,
+            image_paragraph,
+            in_table,
+            self.environment_styles.last().map(String::as_str),
+            indent,
+        );
         self.xml.push_str("<w:p><w:pPr>");
-        if let Some(style) = style {
-            self.xml
-                .push_str(&format!("<w:pStyle w:val=\"{}\"/>", style));
-        }
+        self.xml
+            .push_str(&format!("<w:pStyle w:val=\"{}\"/>", style));
         if let Some(align) = align {
             self.xml
                 .push_str(&format!("<w:jc w:val=\"{}\"/>", alignment(align)));
         }
-        if indent {
+        if indent && style != "BodyTextFirstIndent" {
             self.xml.push_str("<w:ind w:firstLine=\"480\"/>");
         }
         self.xml.push_str(MATH_TABS);
@@ -739,9 +778,12 @@ impl Renderer {
                     rule("bottom", row.rule_bottom)
                 ));
                 if cell.blocks.is_empty() {
-                    self.xml.push_str("<w:p/>");
+                    self.xml
+                        .push_str("<w:p><w:pPr><w:pStyle w:val=\"TableText\"/></w:pPr></w:p>");
                 } else {
+                    self.table_depth += 1;
                     self.blocks(&cell.blocks, Some(cell.align));
+                    self.table_depth -= 1;
                 }
                 self.xml.push_str("</w:tc>");
             }
@@ -854,12 +896,21 @@ impl Renderer {
 }
 
 fn simple_block_xml(xml: &mut String, block: &Block) {
-    if let Block::Para { inlines, .. } = block {
-        simple_inlines_xml(xml, inlines);
-    } else if let Block::AlignBlock(_, blocks) = block {
-        for block in blocks {
-            simple_block_xml(xml, block);
+    match block {
+        Block::Para { inlines, .. } | Block::Caption { inlines, .. } => {
+            simple_inlines_xml(xml, inlines)
         }
+        Block::AlignBlock(_, blocks) => {
+            for block in blocks {
+                simple_block_xml(xml, block);
+            }
+        }
+        Block::Environment { content, .. } => {
+            for block in content {
+                simple_block_xml(xml, block);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -919,6 +970,89 @@ fn safe_anchor(anchor: &str) -> String {
     value
 }
 
+fn paragraph_layout(
+    inlines: &[Inline],
+    align: Option<Align>,
+    indent: bool,
+    in_table: bool,
+) -> (Option<Align>, bool) {
+    if contains_image(inlines) || in_table {
+        (align, false)
+    } else {
+        (align, indent)
+    }
+}
+
+fn paragraph_style(
+    explicit: Option<&str>,
+    image: bool,
+    in_table: bool,
+    environment: Option<&str>,
+    indent: bool,
+) -> String {
+    if let Some(style) = explicit {
+        return style.to_string();
+    }
+    if image {
+        return "Picture".into();
+    }
+    if in_table {
+        return "TableText".into();
+    }
+    if let Some(environment) = environment {
+        return environment_style_id(environment);
+    }
+    if indent {
+        "BodyTextFirstIndent".into()
+    } else {
+        "BodyText".into()
+    }
+}
+
+fn caption_style(kind: &str) -> &'static str {
+    if kind == "table" {
+        "TableCaption"
+    } else {
+        "Caption"
+    }
+}
+
+fn environment_style_id(name: &str) -> String {
+    match name {
+        "abstract" => return "Abstract".into(),
+        "quote" => return "Quote".into(),
+        _ => {}
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("Environment{:016x}", hash)
+}
+
+fn contains_image(inlines: &[Inline]) -> bool {
+    inlines.iter().any(|inline| match inline {
+        Inline::Image(_) => true,
+        Inline::Bold(content)
+        | Inline::Italic(content)
+        | Inline::BoldItalic(content)
+        | Inline::Underline(content)
+        | Inline::Strike(content)
+        | Inline::SmallCaps(content)
+        | Inline::Slanted(content)
+        | Inline::Superscript(content)
+        | Inline::Subscript(content)
+        | Inline::Family(_, content)
+        | Inline::FontSize(_, content)
+        | Inline::Group(content) => contains_image(content),
+        Inline::Color { content, .. }
+        | Inline::Highlight { content, .. }
+        | Inline::Link { content, .. } => contains_image(content),
+        _ => false,
+    })
+}
+
 fn alignment(align: Align) -> &'static str {
     match align {
         Align::Left => "left",
@@ -960,14 +1094,26 @@ fn root_relationships() -> String {
     format!("{}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"{}\" Target=\"word/document.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/><Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/></Relationships>", XML_DECL, REL_OFFICE)
 }
 
-fn styles() -> String {
+fn styles(environments: &[String]) -> String {
     let mut xml = format!("{}<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"Calibri\" w:hAnsi=\"Calibri\" w:eastAsia=\"SimSun\"/><w:sz w:val=\"24\"/><w:szCs w:val=\"24\"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault></w:docDefaults>", XML_DECL);
     xml.push_str("<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/></w:style><w:style w:type=\"character\" w:styleId=\"Hyperlink\"><w:name w:val=\"Hyperlink\"/><w:rPr><w:color w:val=\"0563C1\"/><w:u w:val=\"single\"/></w:rPr></w:style><w:style w:type=\"character\" w:styleId=\"FootnoteReference\"><w:name w:val=\"footnote reference\"/><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr></w:style>");
+    xml.push_str("<w:style w:type=\"paragraph\" w:styleId=\"BodyText\"><w:name w:val=\"body text\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"BodyText\"/><w:qFormat/></w:style><w:style w:type=\"paragraph\" w:styleId=\"BodyTextFirstIndent\"><w:name w:val=\"body text first indent\"/><w:basedOn w:val=\"BodyText\"/><w:next w:val=\"BodyText\"/><w:qFormat/><w:pPr><w:ind w:firstLine=\"480\"/></w:pPr></w:style><w:style w:styleId=\"Abstract\" w:type=\"paragraph\"><w:name w:val=\"abstract\"/><w:basedOn w:val=\"BodyText\"/><w:next w:val=\"BodyText\"/></w:style><w:style w:styleId=\"Picture\" w:type=\"paragraph\" w:customStyle=\"1\"><w:name w:val=\"图片\"/><w:basedOn w:val=\"BodyText\"/><w:next w:val=\"BodyText\"/><w:pPr><w:keepNext/><w:jc w:val=\"center\"/><w:ind w:firstLine=\"0\"/></w:pPr></w:style><w:style w:styleId=\"TableText\" w:type=\"paragraph\" w:customStyle=\"1\"><w:name w:val=\"表格正文\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"TableText\"/><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/><w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/></w:pPr></w:style><w:style w:styleId=\"TableCaption\" w:type=\"paragraph\" w:customStyle=\"1\"><w:name w:val=\"表格题注\"/><w:basedOn w:val=\"Caption\"/><w:next w:val=\"BodyText\"/></w:style>");
     for level in 1..=9 {
         let size = (34 - level * 2).max(22);
         xml.push_str(&format!("<w:style w:type=\"paragraph\" w:styleId=\"Heading{}\"><w:name w:val=\"heading {}\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"120\"/><w:outlineLvl w:val=\"{}\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"{}\"/><w:szCs w:val=\"{}\"/></w:rPr></w:style>", level, level, level - 1, size, size));
     }
-    xml.push_str("<w:style w:type=\"paragraph\" w:styleId=\"Title\"><w:name w:val=\"Title\"/><w:pPr><w:jc w:val=\"center\"/><w:spacing w:before=\"2400\" w:after=\"360\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"44\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Author\"><w:name w:val=\"Author\"/><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:rPr><w:sz w:val=\"28\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Date\"><w:name w:val=\"Date\"/><w:pPr><w:jc w:val=\"center\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Caption\"><w:name w:val=\"caption\"/><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:rPr><w:i/><w:sz w:val=\"20\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Bibliography\"><w:name w:val=\"Bibliography\"/><w:pPr><w:ind w:left=\"480\" w:hanging=\"480\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Glossary\"><w:name w:val=\"Glossary\"/><w:pPr><w:ind w:left=\"480\" w:hanging=\"480\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"ListParagraph\"><w:name w:val=\"List Paragraph\"/><w:pPr><w:ind w:left=\"720\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"FootnoteText\"><w:name w:val=\"footnote text\"/><w:rPr><w:sz w:val=\"20\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Verbatim\"><w:name w:val=\"Verbatim\"/><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/><w:sz w:val=\"20\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/><w:pPr><w:ind w:left=\"720\" w:right=\"720\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Theorem\"><w:name w:val=\"Theorem\"/><w:pPr><w:keepNext/></w:pPr></w:style>");
+    xml.push_str("<w:style w:type=\"paragraph\" w:styleId=\"Title\"><w:name w:val=\"Title\"/><w:pPr><w:jc w:val=\"center\"/><w:spacing w:before=\"2400\" w:after=\"360\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"44\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Author\"><w:name w:val=\"Author\"/><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:rPr><w:sz w:val=\"28\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Date\"><w:name w:val=\"Date\"/><w:pPr><w:jc w:val=\"center\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Caption\"><w:name w:val=\"caption\"/><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:rPr><w:i/><w:sz w:val=\"20\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Bibliography\"><w:name w:val=\"Bibliography\"/><w:pPr><w:ind w:left=\"480\" w:hanging=\"480\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Glossary\"><w:name w:val=\"Glossary\"/><w:pPr><w:ind w:left=\"480\" w:hanging=\"480\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"ListParagraph\"><w:name w:val=\"List Paragraph\"/><w:pPr><w:ind w:left=\"720\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"FootnoteText\"><w:name w:val=\"footnote text\"/><w:rPr><w:sz w:val=\"20\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Verbatim\"><w:name w:val=\"Verbatim\"/><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/><w:sz w:val=\"20\"/></w:rPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"quote\"/><w:pPr><w:ind w:left=\"720\" w:right=\"720\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Theorem\"><w:name w:val=\"Theorem\"/><w:pPr><w:keepNext/></w:pPr></w:style>");
+    for name in environments {
+        if matches!(name.as_str(), "abstract" | "quote") {
+            continue;
+        }
+        let id = environment_style_id(name);
+        xml.push_str(&format!(
+            "<w:style w:type=\"paragraph\" w:styleId=\"{}\" w:customStyle=\"1\"><w:name w:val=\"{}\"/><w:basedOn w:val=\"BodyText\"/><w:next w:val=\"BodyText\"/></w:style>",
+            id,
+            escape(name)
+        ));
+    }
     xml.push_str("</w:styles>");
     xml
 }
@@ -1006,4 +1152,69 @@ fn core_properties() -> String {
 
 fn app_properties() -> String {
     format!("{}<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\"><Application>doclatex</Application></Properties>", XML_DECL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image() -> Inline {
+        Inline::Image(Image {
+            path: "image.png".into(),
+            data: vec![],
+            width_px: 100,
+            height_px: 50,
+            width_pt: Some(72.0),
+            height_pt: Some(36.0),
+            alt: "image".into(),
+        })
+    }
+
+    #[test]
+    fn images_use_centered_picture_style_without_indent() {
+        let inlines = vec![Inline::Group(vec![image()])];
+        assert_eq!(paragraph_layout(&inlines, None, true, false), (None, false));
+        assert_eq!(
+            paragraph_layout(&inlines, Some(Align::Left), true, false),
+            (Some(Align::Left), false)
+        );
+        assert_eq!(paragraph_style(None, true, false, None, false), "Picture");
+        let styles = styles(&[]);
+        assert!(styles.contains("<w:name w:val=\"图片\"/>"));
+        assert!(styles.contains("<w:keepNext/><w:jc w:val=\"center\"/>"));
+    }
+
+    #[test]
+    fn body_styles_follow_first_line_indent() {
+        let inlines = vec![Inline::Text("text".into())];
+        assert_eq!(paragraph_layout(&inlines, None, true, false), (None, true));
+        assert_eq!(
+            paragraph_style(None, false, false, None, true),
+            "BodyTextFirstIndent"
+        );
+        assert_eq!(paragraph_style(None, false, false, None, false), "BodyText");
+    }
+
+    #[test]
+    fn table_and_environment_styles_take_effect() {
+        assert_eq!(
+            paragraph_style(None, false, true, Some("proof"), true),
+            "TableText"
+        );
+        assert_eq!(
+            paragraph_style(None, false, false, Some("abstract"), true),
+            "Abstract"
+        );
+        let id = paragraph_style(None, false, false, Some("proof"), true);
+        let styles = styles(&["proof".into()]);
+        assert!(styles.contains(&format!("w:styleId=\"{}\"", id)));
+        assert!(styles.contains("<w:name w:val=\"proof\"/>"));
+    }
+
+    #[test]
+    fn table_caption_has_distinct_style() {
+        assert_eq!(caption_style("figure"), "Caption");
+        assert_eq!(caption_style("table"), "TableCaption");
+        assert!(styles(&[]).contains("<w:name w:val=\"表格题注\"/>"));
+    }
 }
