@@ -113,7 +113,7 @@ cargo build --release
 ## 使用方法
 
 ```text
-doclatex <input.tex> [-o <output.docx>]
+doclatex <input.tex> [-o <output.docx>] [-v]
 doclatex --help
 doclatex --version
 ```
@@ -130,7 +130,7 @@ cargo run -- path/to/main.tex --output path/to/main.docx
 target/release/doclatex path/to/main.tex -o path/to/main.docx
 ```
 
-如果省略 `-o`/`--output`，会将输入文件的扩展名替换为 `.docx`。每次编译自动执行两遍展开/解析，并在输入文件旁写入 `.aux` 文件。已有输出文件和 `.aux` 文件会被覆盖。
+如果省略 `-o`/`--output`，会将输入文件的扩展名替换为 `.docx`。使用 `-v` 或 `--verbose` 可向标准错误输出四个编译阶段的进度；默认仅输出警告和最终输出路径。每次编译自动执行两遍展开/解析，并在输入文件旁写入 `.aux` 文件。已有输出文件和 `.aux` 文件会被覆盖。
 
 相对输入和输出路径均相对于调用 DocLaTeX 时所在的目录解析。被包含的源码、文档类、宏包、图片和参考文献应保留在项目原有的相对路径上。
 

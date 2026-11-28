@@ -113,7 +113,7 @@ The executable is written to `target/release/doclatex`.
 ## Usage
 
 ```text
-doclatex <input.tex> [-o <output.docx>]
+doclatex <input.tex> [-o <output.docx>] [-v]
 doclatex --help
 doclatex --version
 ```
@@ -130,7 +130,7 @@ Or run the release binary directly:
 target/release/doclatex path/to/main.tex -o path/to/main.docx
 ```
 
-If `-o`/`--output` is omitted, the input extension is replaced with `.docx`. Each compile automatically performs two expansion/parsing passes and writes an `.aux` file beside the input file. Existing output and `.aux` files are overwritten.
+If `-o`/`--output` is omitted, the input extension is replaced with `.docx`. Use `-v` or `--verbose` to print four compilation stages to standard error; by default, only warnings and the final output path are printed. Each compile automatically performs two expansion/parsing passes and writes an `.aux` file beside the input file. Existing output and `.aux` files are overwritten.
 
 Relative input and output paths are resolved against the directory from which DocLaTeX is invoked. Included sources, classes, packages, graphics, and bibliographies should therefore remain available at their original project-relative paths.
 

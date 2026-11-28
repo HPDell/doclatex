@@ -24,16 +24,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut verbose = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                println!("doclatex — compile LaTeX directly to Microsoft Word\n\nUsage: doclatex <input.tex> [-o <output.docx>]\n\nThe converter performs two passes and writes a .aux file beside the input.");
+                println!("doclatex — compile LaTeX directly to Microsoft Word\n\nUsage: doclatex <input.tex> [-o <output.docx>] [-v]\n\nOptions:\n  -o, --output <output.docx>  Set the output path\n  -v, --verbose              Show compilation progress\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nThe converter performs two passes and writes a .aux file beside the input.");
                 return Ok(());
             }
             "-V" | "--version" => {
                 println!("doclatex {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
+            "-v" | "--verbose" => verbose = true,
             "-o" | "--output" => {
                 output = Some(PathBuf::from(
                     args.next().ok_or("missing output path after -o")?,
@@ -44,7 +46,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             _ => return Err("only one input file may be specified".into()),
         }
     }
-    let input = input.ok_or("usage: doclatex <input.tex> [-o <output.docx>]")?;
+    let input = input.ok_or("usage: doclatex <input.tex> [-o <output.docx>] [-v]")?;
     let original_dir = std::env::current_dir()?;
     let input = absolute_path(&original_dir, &input);
     let output = match output {
@@ -60,6 +62,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let aux_path = input.with_extension("aux");
     std::env::set_current_dir(&job_dir)?;
 
+    progress(verbose, 1, "expanding and parsing source (first pass)");
     let mut first_state = State::new();
     first_state.jobname = input
         .file_stem()
@@ -74,6 +77,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         &AuxData::default(),
         &mut first_bib,
     );
+    progress(
+        verbose,
+        2,
+        "resolving bibliography and writing auxiliary data",
+    );
     AuxData::write(
         &aux_path,
         &first.doc.labels,
@@ -83,6 +91,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
     first_bib.resolve(Path::new("."));
 
+    progress(verbose, 3, "expanding and parsing source (second pass)");
     let aux = AuxData::read(&aux_path);
     let mut second_state = State::new();
     second_state.jobname = first_state.jobname.clone();
@@ -98,6 +107,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &second_bib.style_name(),
     );
 
+    progress(verbose, 4, "writing DOCX output");
     docx::write_docx(&output, &second.doc)
         .map_err(|e| format!("cannot write {}: {}", output.display(), e))?;
     let mut warnings = second.doc.warnings.clone();
@@ -109,6 +119,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     eprintln!("wrote {}", output.display());
     Ok(())
+}
+
+fn progress(verbose: bool, step: u8, message: &str) {
+    if verbose {
+        eprintln!("doclatex: [{step}/4] {message}");
+    }
 }
 
 fn absolute_path(base: &Path, path: &Path) -> PathBuf {

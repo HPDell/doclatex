@@ -56,12 +56,12 @@ The resulting executable is `target/release/doclatex`; the debug executable is `
 CLI usage is:
 
 ```text
-doclatex <input.tex> [-o <output.docx>]
+doclatex <input.tex> [-o <output.docx>] [-v]
 doclatex --help
 doclatex --version
 ```
 
-`--output` is the long form of `-o`. Without it, output is the input path with a `.docx` extension. Relative input and output paths are resolved against the caller's original working directory. The input and output must be different files.
+`--output` is the long form of `-o`. Without it, output is the input path with a `.docx` extension. `-v`/`--verbose` enables four-stage progress reporting on standard error; warnings and the final output path are printed regardless of this flag. Relative input and output paths are resolved against the caller's original working directory. The input and output must be different files.
 
 To run the demo without modifying the tracked example outputs, copy its inputs to a temporary directory:
 
