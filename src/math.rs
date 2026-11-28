@@ -1031,7 +1031,7 @@ impl<'a> MathParser<'a> {
             ";" => nodes.push(Node::Space(" ".into())),
             ":" => nodes.push(Node::Space(" ".into())),
             "!" => nodes.push(Node::Space("".into())),
-            " " | "space" => nodes.push(Node::Space(" ".into())),
+            " " | "space" | "nobreakspace" => nodes.push(Node::Space(" ".into())),
             "hspace" => {
                 let _ = self.parse_raw_group();
                 nodes.push(Node::Space(" ".into()));

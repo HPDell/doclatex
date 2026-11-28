@@ -133,6 +133,7 @@ pub struct State {
     pub font_size_pt: f64,
     pub paper: String, // "a4" | "letter"
     pub two_column: bool,
+    pub text_width_pt: f64,
     pub jobname: String,
     /// hyperref loaded? (links colored)
     pub hyperref_loaded: bool,
@@ -172,6 +173,7 @@ impl State {
             font_size_pt: 12.0,
             paper: "letter".into(),
             two_column: false,
+            text_width_pt: 468.0,
             jobname: "texput".into(),
             hyperref_loaded: false,
             hidelinks: false,
@@ -626,12 +628,14 @@ pub fn is_native(name: &str) -> bool {
         "documentclass" | "begin" | "end" | "title" | "author" | "date" | "thanks"
         | "maketitle" | "tableofcontents" | "listoffigures" | "listoftables" | "appendix"
         | "frontmatter" | "mainmatter" | "backmatter" | "linespread" | "geometry"
-        | "hypersetup" | "pagestyle" | "thispagestyle" | "pagenumbering" | "setlength"
+        | "newgeometry" | "AtBeginDocument" | "hypersetup" | "pagestyle" | "thispagestyle"
+        | "pagenumbering" | "setlength"
         | "addtolength" | "addcontentsline" | "addtocontents" | "markboth" | "markright"
         | "selectlanguage" | "otherlanguage" | "setmainfont" | "setsansfont" | "setmonofont"
         | "setCJKmainfont" | "today" | "index" | "glossary" | "shorttoc" | "savegeometry"
         | "loadgeometry" | "usepackage" | "RequirePackage" | "LoadClass" | "ExecuteOptions"
         | "ProcessOptions" | "DeclareOption" | "CurrentOption" | "PassOptionsToPackage"
+        | "PassOptionsToClass" | "ProvidesClass"
         | "baselinestretch" | "flushbottom" | "raggedbottom" | "sloppy" | "fussy"
         | "onecolumn" | "twocolumn" | "twoside" | "oneside" | "openright" | "openany"
         | "cleardoublepage" | "suppressfloats" | "displaybreak" | "allowdisplaybreaks"
@@ -853,6 +857,12 @@ pub fn scan_int(st: &State, cur: &mut Cursor) -> i64 {
                     0
                 }
             },
+            Some(t) if t.is_bgroup() => {
+                cur.pos -= 1;
+                let group = cur.read_group();
+                let mut grouped = Cursor::new(group);
+                expr(st, &mut grouped)
+            }
             Some(Token::Char(c, _)) if c.is_ascii_digit() => {
                 let mut s = String::new();
                 s.push(c);
@@ -1087,11 +1097,24 @@ enum CondState {
     FalseBranch,
 }
 
+#[derive(Default)]
+struct OptionContext {
+    supplied: Vec<String>,
+    declared: HashMap<String, Vec<Token>>,
+    fallback: Option<Vec<Token>>,
+}
+
 pub struct Expander<'a> {
     pub st: &'a mut State,
     cond_stack: Vec<CondState>,
     loaded_packages: HashSet<PathBuf>,
+    loaded_classes: HashSet<PathBuf>,
     source_directories: Vec<PathBuf>,
+    option_contexts: Vec<OptionContext>,
+    current_options: Vec<String>,
+    document_options: Vec<String>,
+    pending_package_options: HashMap<String, Vec<String>>,
+    pending_class_options: HashMap<String, Vec<String>>,
 }
 
 /// Drain input stack into a cursor (caller MUST restack the remainder).
@@ -1114,7 +1137,13 @@ impl<'a> Expander<'a> {
             st,
             cond_stack: vec![],
             loaded_packages: HashSet::new(),
+            loaded_classes: HashSet::new(),
             source_directories: vec![],
+            option_contexts: vec![],
+            current_options: vec![],
+            document_options: vec![],
+            pending_package_options: HashMap::new(),
+            pending_class_options: HashMap::new(),
         }
     }
 
@@ -1463,7 +1492,46 @@ impl<'a> Expander<'a> {
             self.do_usepackage(input, out, name);
             return;
         }
-        if name == "ProvidesPackage" || name == "NeedsTeXFormat" {
+        if name == "documentclass" || name == "LoadClass" {
+            self.do_documentclass(input, out, name);
+            return;
+        }
+        if name == "DeclareOption" {
+            self.do_declare_option(input);
+            return;
+        }
+        if name == "ProcessOptions" {
+            self.do_process_options(input, out);
+            return;
+        }
+        if name == "ExecuteOptions" {
+            self.do_execute_options(input, out);
+            return;
+        }
+        if name == "PassOptionsToPackage" || name == "PassOptionsToClass" {
+            self.do_pass_options(input, name == "PassOptionsToClass");
+            return;
+        }
+        if name == "CurrentOption" {
+            if let Some(option) = self.current_options.last().cloned() {
+                for c in option.chars() {
+                    out.push(Token::Char(c, CatCode::Other));
+                }
+            }
+            return;
+        }
+        if name == "@setfontsize" {
+            if let Some(token) = input.pop_tok(self.cats()) {
+                match token {
+                    Token::CtrlSeq(command) => out.push(Token::CtrlSeq(command)),
+                    other => out.push(other),
+                }
+            }
+            let _ = self.scan_undelimited(input);
+            let _ = self.scan_undelimited(input);
+            return;
+        }
+        if name == "ProvidesPackage" || name == "ProvidesClass" || name == "NeedsTeXFormat" {
             let _ = self.scan_undelimited(input);
             if matches!(self.take_spaces_and_peek(input), Some(Token::Char('[', _))) {
                 let _ = self.scan_bracket(input);
@@ -2426,6 +2494,10 @@ impl<'a> Expander<'a> {
             None
         };
         let packages = self.scan_undelimited(input);
+        let explicit_options = optional
+            .as_ref()
+            .map(|tokens| split_options(&detokenize(tokens)))
+            .unwrap_or_default();
 
         out.push(Token::cs(name));
         if let Some(optional) = optional {
@@ -2460,23 +2532,194 @@ impl<'a> Expander<'a> {
             if !self.loaded_packages.insert(path.clone()) {
                 continue;
             }
-            match std::fs::read_to_string(&path) {
-                Ok(src) => {
-                    let previous_at = cat_of(self.cats(), '@');
-                    self.st.catcodes.insert('@', 11);
-                    let directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-                    let mut package_input =
-                        InputStack::with_source_at(&src, Some(directory.clone()));
-                    self.source_directories.push(directory);
-                    let expanded = self.expand_loop(&mut package_input, ExpandMode::Normal);
-                    self.source_directories.pop();
-                    self.st.catcodes.insert('@', previous_at);
-                    out.extend(expanded);
-                }
-                Err(_) => self
-                    .st
-                    .warn(format!("cannot read package {}", path.display())),
+            let mut options = self.document_options.clone();
+            options.extend(
+                self.pending_package_options
+                    .remove(package)
+                    .unwrap_or_default(),
+            );
+            options.extend(explicit_options.iter().cloned());
+            self.expand_definition_file(&path, options, out, "package");
+        }
+    }
+
+    fn do_documentclass(&mut self, input: &mut InputStack, out: &mut Vec<Token>, name: &str) {
+        let optional = if matches!(self.take_spaces_and_peek(input), Some(Token::Char('[', _))) {
+            Some(self.scan_bracket(input))
+        } else {
+            None
+        };
+        let class = self.scan_undelimited(input);
+        let class_name = detokenize(&class).trim().to_string();
+        let explicit_options = optional
+            .as_ref()
+            .map(|tokens| split_options(&detokenize(tokens)));
+
+        out.push(Token::cs(name));
+        if let Some(optional) = optional {
+            out.push(Token::Char('[', CatCode::Other));
+            out.extend(optional);
+            out.push(Token::Char(']', CatCode::Other));
+        }
+        out.push(Token::Char('{', CatCode::BGroup));
+        out.extend(class);
+        out.push(Token::Char('}', CatCode::EGroup));
+        if class_name.is_empty() {
+            return;
+        }
+
+        let mut options = if let Some(explicit) = explicit_options {
+            if name == "documentclass" {
+                self.document_options = explicit.clone();
             }
+            explicit
+        } else if name == "LoadClass" {
+            self.option_contexts
+                .last()
+                .map(|context| context.supplied.clone())
+                .unwrap_or_else(|| self.document_options.clone())
+        } else {
+            self.document_options.clear();
+            vec![]
+        };
+        let mut passed = self
+            .pending_class_options
+            .remove(&class_name)
+            .unwrap_or_default();
+        passed.extend(options);
+        options = passed;
+
+        let base = input
+            .current_directory()
+            .map(Path::to_path_buf)
+            .or_else(|| self.source_directories.last().cloned());
+        let path = match find_input_file_at(self.st, &class_name, base.as_deref(), "cls") {
+            Some(path) => path.canonicalize().unwrap_or(path),
+            None if is_builtin_class(&class_name) => return,
+            None => {
+                self.st.warn(format!(
+                    "class not found: {} (expected {}.cls)",
+                    class_name, class_name
+                ));
+                return;
+            }
+        };
+        if self.loaded_classes.insert(path.clone()) {
+            self.expand_definition_file(&path, options, out, "class");
+        }
+    }
+
+    fn expand_definition_file(
+        &mut self,
+        path: &Path,
+        options: Vec<String>,
+        out: &mut Vec<Token>,
+        kind: &str,
+    ) {
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(_) => {
+                self.st
+                    .warn(format!("cannot read {} {}", kind, path.display()));
+                return;
+            }
+        };
+        let previous_at = cat_of(self.cats(), '@');
+        self.st.catcodes.insert('@', 11);
+        let directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut file_input = InputStack::with_source_at(&src, Some(directory.clone()));
+        self.source_directories.push(directory);
+        self.option_contexts.push(OptionContext {
+            supplied: options,
+            ..OptionContext::default()
+        });
+        let expanded = self.expand_loop(&mut file_input, ExpandMode::Normal);
+        self.option_contexts.pop();
+        self.source_directories.pop();
+        self.st.catcodes.insert('@', previous_at);
+        out.extend(expanded);
+    }
+
+    fn do_declare_option(&mut self, input: &mut InputStack) {
+        let fallback = if matches!(self.take_spaces_and_peek(input), Some(Token::Char('*', _))) {
+            let _ = input.pop_tok(self.cats());
+            true
+        } else {
+            false
+        };
+        let (option, code) = if fallback {
+            (String::new(), self.scan_undelimited(input))
+        } else {
+            (
+                detokenize(&self.scan_undelimited(input)).trim().to_string(),
+                self.scan_undelimited(input),
+            )
+        };
+        if let Some(context) = self.option_contexts.last_mut() {
+            if fallback {
+                context.fallback = Some(code);
+            } else {
+                context.declared.insert(option, code);
+            }
+        }
+    }
+
+    fn do_process_options(&mut self, input: &mut InputStack, out: &mut Vec<Token>) {
+        if matches!(self.take_spaces_and_peek(input), Some(Token::Char('*', _))) {
+            let _ = input.pop_tok(self.cats());
+        }
+        let Some(context) = self.option_contexts.last() else {
+            return;
+        };
+        let supplied = context.supplied.clone();
+        let declared = context.declared.clone();
+        let fallback = context.fallback.clone();
+        for option in supplied {
+            let code = declared.get(&option).cloned().or_else(|| fallback.clone());
+            if let Some(code) = code {
+                self.expand_option(option, code, out);
+            }
+        }
+    }
+
+    fn do_execute_options(&mut self, input: &mut InputStack, out: &mut Vec<Token>) {
+        let options = split_options(&detokenize(&self.scan_undelimited(input)));
+        let declared = self
+            .option_contexts
+            .last()
+            .map(|context| context.declared.clone())
+            .unwrap_or_default();
+        for option in options {
+            if let Some(code) = declared.get(&option).cloned() {
+                self.expand_option(option, code, out);
+            }
+        }
+    }
+
+    fn expand_option(&mut self, option: String, code: Vec<Token>, out: &mut Vec<Token>) {
+        self.current_options.push(option);
+        let expanded = self.expand_all(code);
+        self.current_options.pop();
+        out.extend(expanded);
+    }
+
+    fn do_pass_options(&mut self, input: &mut InputStack, class: bool) {
+        let options = split_options(&detokenize(&self.scan_undelimited(input)));
+        let targets = detokenize(&self.scan_undelimited(input));
+        for target in targets
+            .split(',')
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+        {
+            let pending = if class {
+                &mut self.pending_class_options
+            } else {
+                &mut self.pending_package_options
+            };
+            pending
+                .entry(target.to_string())
+                .or_default()
+                .extend(options.iter().cloned());
         }
     }
 
@@ -2642,6 +2885,9 @@ impl<'a> Expander<'a> {
             _ => {}
         }
         restack(input, &cur);
+        if is_native(&cmd_name) {
+            return true;
+        }
 
         let mut mac = Macro {
             params,
@@ -2844,6 +3090,40 @@ fn find_input_file_at(
     candidates.into_iter().find(|p| p.is_file())
 }
 
+fn split_options(options: &str) -> Vec<String> {
+    options
+        .split(',')
+        .map(str::trim)
+        .filter(|option| !option.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_builtin_class(class: &str) -> bool {
+    matches!(
+        class,
+        "article"
+            | "report"
+            | "book"
+            | "letter"
+            | "slides"
+            | "proc"
+            | "minimal"
+            | "ctexart"
+            | "ctexrep"
+            | "ctexbook"
+            | "ctexbeamer"
+            | "beamer"
+            | "memoir"
+            | "scrartcl"
+            | "scrreprt"
+            | "scrbook"
+            | "IEEEtran"
+            | "standalone"
+            | "exam"
+    )
+}
+
 fn is_builtin_package(package: &str) -> bool {
     matches!(
         package,
@@ -2877,6 +3157,9 @@ fn is_builtin_package(package: &str) -> bool {
             | "babel"
             | "polyglossia"
             | "enumitem"
+            | "enumerate"
+            | "nicefrac"
+            | "subfiles"
             | "caption"
             | "subcaption"
             | "float"
@@ -3099,5 +3382,138 @@ mod tests {
         );
         assert_eq!(st.warnings.len(), 1, "got {:?}", st.warnings);
         assert!(st.warnings[0].contains("definitely_missing_doclatex_package"));
+    }
+
+    #[test]
+    fn loads_recursive_class_macros_and_options_without_cycles() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "doclatex-classes-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("custom.cls"),
+            r"\ProvidesClass{custom}[2026/11/26]
+\DeclareOption{custom}{\newcommand{\classoption}{Custom}}
+\ProcessOptions
+\newcommand{\custom@internal}[1]{Class:#1}
+\newcommand{\fromclass}[1]{\custom@internal{#1}}
+\LoadClass{base}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("base.cls"),
+            r"\ProvidesClass{base}
+\DeclareOption{base}{\newcommand{\baseoption}{BaseOption}}
+\ProcessOptions
+\newcommand{\frombase}{Base}
+\LoadClass{custom}",
+        )
+        .unwrap();
+
+        let class = dir.join("custom").display().to_string();
+        let source = format!(
+            "\\documentclass[custom,base]{{{}}}\\classoption\\fromclass{{X}}\\baseoption\\frombase",
+            class
+        );
+        let mut st = State::new();
+        let out = run_src(&mut st, &source);
+
+        assert!(out.contains("Custom"), "got {}", out);
+        assert!(out.contains("Class:X"), "got {}", out);
+        assert!(out.contains("BaseOption"), "got {}", out);
+        assert!(out.contains("Base"), "got {}", out);
+        assert!(!out.contains("ProvidesClass"), "got {}", out);
+        assert!(!out.contains("2026/11/26"), "got {}", out);
+        assert_eq!(cat_of(&st.catcodes, '@'), 12);
+        assert!(st.warnings.is_empty(), "got {:?}", st.warnings);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn class_default_and_fallback_options_execute() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "doclatex-class-options-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("options.cls"),
+            r"\ProvidesClass{options}
+\DeclareOption{alpha}{\def\chosen{Alpha}}
+\DeclareOption*{\edef\chosen{Other:\CurrentOption}}
+\ExecuteOptions{alpha}
+\ProcessOptions",
+        )
+        .unwrap();
+        let class = dir.join("options").display().to_string();
+
+        let mut default_state = State::new();
+        let default_out = run_src(
+            &mut default_state,
+            &format!("\\documentclass{{{}}}\\chosen", class),
+        );
+        assert!(default_out.ends_with("Alpha"), "got {}", default_out);
+
+        let mut fallback_state = State::new();
+        let fallback_out = run_src(
+            &mut fallback_state,
+            &format!("\\documentclass[beta]{{{}}}\\chosen", class),
+        );
+        assert!(fallback_out.ends_with("Other:beta"), "got {}", fallback_out);
+        assert!(default_state.warnings.is_empty());
+        assert!(fallback_state.warnings.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_custom_class_warns_but_builtin_does_not() {
+        let mut st = State::new();
+        let _ = run_src(
+            &mut st,
+            r"\documentclass{article}\LoadClass{report}\documentclass{definitely_missing_doclatex_class}",
+        );
+        assert_eq!(st.warnings.len(), 1, "got {:?}", st.warnings);
+        assert!(st.warnings[0].contains("definitely_missing_doclatex_class"));
+    }
+
+    #[test]
+    fn setfontsize_does_not_reexpand_its_command_argument() {
+        let mut st = State::new();
+        let out = run_src(
+            &mut st,
+            r"\makeatletter\renewcommand{\normalsize}{\@setfontsize\normalsize\@xpt{12}}\normalsize",
+        );
+        assert!(out.ends_with("\\normalsize"), "got {}", out);
+    }
+
+    #[test]
+    fn setcounter_accepts_braced_values() {
+        let mut st = State::new();
+        let out = run_src(&mut st, r"\setcounter{footnote}{7}Text");
+        assert_eq!(st.counter_value("footnote"), 7);
+        assert_eq!(out, "Text");
+    }
+
+    #[test]
+    fn package_redefinitions_preserve_native_structure_commands() {
+        let mut st = State::new();
+        let out = run_src(
+            &mut st,
+            r"\renewcommand{\maketitle}{Broken}\renewcommand{\section}{Broken}\maketitle\section{Working}",
+        );
+        assert!(out.contains("\\maketitle"), "got {}", out);
+        assert!(out.contains("\\section{Working}"), "got {}", out);
+        assert!(!out.contains("Broken"), "got {}", out);
     }
 }
